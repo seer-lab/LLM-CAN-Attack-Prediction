@@ -6,3 +6,7 @@ __pycache__/
 CAN-Intrusion/
 #ignore CIC-IoV
 CIC-IoV/
+#ignore CAN-CarHacking
+CAN-CarHacking/
+#ignore outputs
+*.outputs/

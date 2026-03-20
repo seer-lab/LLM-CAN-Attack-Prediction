@@ -10,10 +10,13 @@ key_file = os.path.join(os.path.dirname(__file__), "key.txt")
 with open(key_file, "r") as f:
     api_key = f.read().strip()
 
+
 client = OpenAI(api_key=api_key)
-BATCH_SIZE = 23
-MAX_ROWS = 500
-PASS_NUMBER = 5
+
+# --- Parameters ---
+BATCH_SIZE = 23       # number of rows per batch
+MAX_ROWS = 500        # max rows per dataset for efficiency
+PASS_NUMBER = 5       # number of passes per row
 
 file_list = [
     "CAN-CarHacking/DoS_dataset_decoded.csv",
