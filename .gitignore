@@ -1,0 +1,8 @@
+# ignore API key
+key.txt
+# ignore compiled files
+__pycache__/
+#ignore CAN-Intrusion
+CAN-Intrusion/
+#ignore CIC-IoV
+CIC-IoV/
