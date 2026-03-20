@@ -9,4 +9,4 @@ CIC-IoV/
 #ignore CAN-CarHacking
 CAN-CarHacking/
 #ignore outputs
-*.outputs/
+outputs_*
