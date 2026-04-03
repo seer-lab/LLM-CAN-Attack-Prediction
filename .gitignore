@@ -1,12 +1,26 @@
 # ignore API key
 key.txt
+
 # ignore compiled files
 __pycache__/
-#ignore CAN-Intrusion
+
+# ignore CAN-Intrusion
 CAN-Intrusion/
-#ignore CIC-IoV
+
+# ignore CIC-IoV
 CIC-IoV/
-#ignore CAN-CarHacking
+
+# ignore CAN-CarHacking
 CAN-CarHacking/
-#ignore outputs
-outputs_*
+
+# ignore RPM logs
+outputs/zero_shot/RPM/logs_*.txt
+outputs/one_shot/RPM/logs_*.txt
+outputs/two_shot/RPM/logs_*.txt
+outputs/three_shot/RPM/logs_*.txt
+
+# ignore Fuzzy logs
+outputs/zero_shot/Fuzzy/logs_*.txt
+outputs/one_shot/Fuzzy/logs_*.txt
+outputs/two_shot/Fuzzy/logs_*.txt
+outputs/three_shot/Fuzzy/logs_*.txt

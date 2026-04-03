@@ -1,143 +1,208 @@
 # code reference from https://github.com/seer-lab/flaky-prompt
-
 import os
 from openai import OpenAI
 import pandas as pd
 import chardet
 
-# Read API key from local file
 key_file = os.path.join(os.path.dirname(__file__), "key.txt")
 with open(key_file, "r") as f:
     api_key = f.read().strip()
 
-
 client = OpenAI(api_key=api_key)
 
-# --- Parameters ---
-BATCH_SIZE = 23       # number of rows per batch
-MAX_ROWS = 500        # max rows per dataset for efficiency
-PASS_NUMBER = 5       # number of passes per row
+BATCH_SIZE = 23
+MAX_ROWS = 300
+PASS_NUMBER = 5
 
 file_list = [
-    "CAN-CarHacking/DoS_dataset_decoded.csv",
     "CAN-CarHacking/RPM_dataset_decoded.csv",
-    "CAN-CarHacking/gear_dataset_decoded.csv",
     "CAN-CarHacking/Fuzzy_dataset_decoded.csv"
 ]
 
 experiment_type = "three_shot"
 
+def split_and_save_dataset(input_file, train_path, test_path, train_ratio=0.8):
+    with open(input_file, "rb") as f:
+        encoding = chardet.detect(f.read())['encoding']
+
+    df = pd.read_csv(input_file, encoding=encoding)
+
+    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+
+    split_idx = int(len(df) * train_ratio)
+
+    train_df = df.iloc[:split_idx]
+    test_df = df.iloc[split_idx:]
+
+    train_df.to_csv(train_path, index=False)
+    test_df.to_csv(test_path, index=False)
+
+    print("\nSplit check:")
+    print(train_df['label'].value_counts())
+    print(test_df['label'].value_counts())
+
+
+# --- HELPERS ---
 def flatten_decoded(decoded):
     if isinstance(decoded, str):
         try:
             d = eval(decoded)
-            return ", ".join(f"{k}={v}" for k,v in d.items())
+            return ", ".join(f"{k}={v}" for k, v in d.items())
         except:
             return decoded
     return str(decoded)
 
-def get_prompt_examples(data, num_batches=2):
-    tr_data = data[data['label'].isin(['T','R'])]
-    total = min(num_batches*BATCH_SIZE, len(tr_data))
-    samples = tr_data.sample(n=total, random_state=42)
+def get_data_slice_with_min_T(data, max_rows=100, min_t=20):
+    t_indices = data.index[data['label'] == 'T'].tolist()
+
+    for t_idx in t_indices:
+        start = max(0, t_idx - max_rows // 2)
+        slice_df = data.iloc[start:start + max_rows]
+
+        if (slice_df['label'] == 'T').sum() >= min_t:
+            return slice_df.reset_index(drop=True)
+
+    raise ValueError("No valid slice")
+
+def get_prompt_examples(data, data_column, num_batches=3):
+    t_data = data[data['label'] == 'T']
+    r_data = data[data['label'] == 'R']
+
     batches = []
-    for i in range(num_batches):
-        batch_samples = samples.iloc[i*BATCH_SIZE:(i+1)*BATCH_SIZE]
-        batch_str = "\n".join([f"{row['arbitration_id']},{row['raw_data']} -> {row['label']}" for _, row in batch_samples.iterrows()])
+
+    for _ in range(num_batches):
+        t_sample = t_data.sample(1)
+        r_sample = r_data.sample(BATCH_SIZE - 1)
+
+        batch = pd.concat([t_sample, r_sample]).sample(frac=1)
+
+        batch_str = "\n".join([
+            f"{row['arbitration_id']},{row[data_column]} -> {row['label']}"
+            for _, row in batch.iterrows()
+        ])
+
         batches.append(batch_str)
+
     return batches
 
-def three_shot_batch_experiment(input_file, output_file, data_column, pass_number=PASS_NUMBER, batch_size=BATCH_SIZE, max_rows=MAX_ROWS):
+# --- EXPERIMENT ---
+def three_shot_batch_experiment(train_file, test_file, output_file, data_column):
     try:
-        with open(input_file, "rb") as f:
-            encoding = chardet.detect(f.read())['encoding']
-        data = pd.read_csv(input_file, encoding=encoding)
-        data = data[data['decoded'] != "UNDECODABLE"]
+        output_dir = os.path.dirname(output_file)
 
-        if max_rows is not None and len(data) > max_rows:
-            data = data.sample(n=max_rows, random_state=42)
+        # TRAIN
+        train_data = pd.read_csv(train_file)
+        train_data = get_data_slice_with_min_T(train_data, MAX_ROWS, 10)
 
-        if data_column=="decoded":
+        if data_column == "decoded":
+            train_data['decoded'] = train_data['decoded'].apply(flatten_decoded)
+
+        prompt_batches = get_prompt_examples(train_data, data_column, 3)
+
+        # TEST
+        data = pd.read_csv(test_file)
+
+        if MAX_ROWS:
+            data = data.iloc[:MAX_ROWS]
+
+        if data_column == "decoded":
             data['decoded'] = data['decoded'].apply(flatten_decoded)
 
-        column_to_use = data_column
         results_df = data.copy()
         results_df['Batch_ID'] = None
 
-        prompt_batches = get_prompt_examples(data, num_batches=3)
+        for i in range(1, PASS_NUMBER + 1):
+            results_df[f"Pass_{i}"] = None
+
         base_prompt = (
             "We are trying to identify cybersecurity attacks in CAN messages.\n"
             "Below are labeled examples (T=attack, R=normal):\n"
-            f"First batch of examples:\n{prompt_batches[0]}\n"
-            f"Second batch of examples:\n{prompt_batches[1]}\n"
-            f"Third batch of examples:\n{prompt_batches[2]}\n"
-            "Now consider the following batch of messages. Are there any cybersecurity attacks in these messages?\n"
-            "Answer Yes or No only. Give a single word as your answer.\n"
+            f"First batch:\n{prompt_batches[0]}\n"
+            f"Second batch:\n{prompt_batches[1]}\n"
+            f"Third batch:\n{prompt_batches[2]}\n"
+            "Now look at the following sequence.\n"
+            "Consider the pattern across all messages.\n\n"
+            "Is the last message part of an attack pattern?\n\n"
+            "Answer Yes or No, and provide a brief 1-2 sentence reason.\n\n"
         )
 
-        batches = [data.iloc[i:i+batch_size] for i in range(0, len(data), batch_size)]
-        for pass_num in range(1, pass_number+1):
-            print(f"\nRunning Pass {pass_num} for {input_file} ({data_column})")
-            for batch_id, batch_df in enumerate(batches):
-                batch_messages = "\n".join([f"{row['arbitration_id']},{row[column_to_use]}" for _, row in batch_df.iterrows()])
+        for pass_num in range(1, PASS_NUMBER + 1):
+            print(f"\nRunning Pass {pass_num} for {test_file} ({data_column})")
 
-                # Include all previous pass predictions in context
-                previous_predictions = []
-                for prev_pass in range(1, pass_num):
-                    previous_predictions.append(
-                        f"Pass {prev_pass}: {results_df.loc[batch_df.index[0], f'Pass_{prev_pass}']}"
-                    )
-                context = ""
-                if previous_predictions:
-                    context = "Previous predictions for this batch:\n" + "\n".join(previous_predictions) + "\n"
+            log_file_path = os.path.join(output_dir, f"logs_{data_column}_pass_{pass_num}.txt")
+            open(log_file_path, "w").close()
 
-                test_case = base_prompt + context + batch_messages
+            for i in range(BATCH_SIZE - 1, len(data)):
+                window = data.iloc[i - BATCH_SIZE + 1:i + 1]
+
+                messages = "\n".join([
+                    f"{row['arbitration_id']},{row[data_column]}"
+                    for _, row in window.iterrows()
+                ])
+
+                test_case = base_prompt + messages
 
                 try:
-                    response = client.chat.completions.create(
+                    res = client.chat.completions.create(
                         model="gpt-4o-mini",
                         temperature=0,
                         messages=[
-                            {"role": "system", "content": "You are a cybersecurity analyst specializing in automotive Controller Area Network (CAN) traffic."},
+                            {"role": "system", "content": "You are a cybersecurity analyst specializing in automotive CAN traffic."},
                             {"role": "user", "content": test_case}
                         ]
                     )
-                    prediction = response.choices[0].message.content.strip()
+                    pred = res.choices[0].message.content.strip()
                 except Exception as e:
-                    prediction = f"Error: {e}"
-                    print(f"Error on batch {batch_id}: {e}")
+                    pred = f"Error: {e}"
 
-                for idx in batch_df.index:
-                    results_df.at[idx, f"Pass_{pass_num}"] = prediction
-                    results_df.at[idx, "Batch_ID"] = batch_id
+                last_idx = window.index[-1]
+                results_df.at[last_idx, f"Pass_{pass_num}"] = pred
+                results_df.at[last_idx, "Batch_ID"] = i
 
-        columns_to_keep = ['arbitration_id', data_column, 'Batch_ID'] + [f'Pass_{i}' for i in range(1, pass_number+1)]
-        results_df = results_df[columns_to_keep]
+                with open(log_file_path, "a", encoding="utf-8") as log_file:
+                    log_file.write(f"\n--- Window ending at index {i} ---\n")
+                    log_file.write("PROMPT:\n" + test_case + "\n")
+                    log_file.write("RESPONSE:\n" + pred + "\n")
 
-        results_df.to_csv(output_file, index=False, encoding="utf-8")
+        cols = ['arbitration_id', data_column, 'Batch_ID'] + [
+            f'Pass_{i}' for i in range(1, PASS_NUMBER + 1)
+        ]
+        results_df = results_df[cols]
+
+        results_df.to_csv(output_file, index=False)
 
     except Exception as e:
-        print(f"An error occurred: {e}")
-base_output_folder = "outputs"
+        print(e)
+
+# --- MAIN ---
+base_data_folder = "data"
+train_folder = os.path.join(base_data_folder, "train")
+test_folder = os.path.join(base_data_folder, "test")
+
+os.makedirs(train_folder, exist_ok=True)
+os.makedirs(test_folder, exist_ok=True)
 
 for input_file in file_list:
-    # Get base filename without extension
-    base_name = os.path.basename(input_file).replace(".csv", "")
-    
-    # Remove '_decoded' if it exists
-    clean_name = base_name.replace("_decoded", "")
-    
-    # Extract dataset name (DoS, RPM, Gear, Fuzzy)
-    dataset_name = clean_name.split("_")[0]
-    
-    # Create folders if they don't exist
-    folder_path = os.path.join(base_output_folder, experiment_type, dataset_name)
-    os.makedirs(folder_path, exist_ok=True)
-    
-    # Output file paths
-    raw_output_file = os.path.join(folder_path, f"{experiment_type}_{dataset_name}_raw_results.csv")
-    decoded_output_file = os.path.join(folder_path, f"{experiment_type}_{dataset_name}_decoded_results.csv")
-    
-    # Run experiments
-    three_shot_batch_experiment(input_file, raw_output_file, "raw_data", PASS_NUMBER)
-    three_shot_batch_experiment(input_file, decoded_output_file, "decoded", PASS_NUMBER)
+    name = os.path.basename(input_file)
+
+    train_file = os.path.join(train_folder, name)
+    test_file = os.path.join(test_folder, name)
+
+    split_and_save_dataset(input_file, train_file, test_file)
+
+base_output_folder = "outputs"
+
+for file_name in ["RPM_dataset_decoded.csv", "Fuzzy_dataset_decoded.csv"]:
+    train_file = os.path.join(train_folder, file_name)
+    test_file = os.path.join(test_folder, file_name)
+
+    dataset_name = file_name.replace("_dataset_decoded.csv", "")
+
+    folder = os.path.join(base_output_folder, experiment_type, dataset_name)
+    os.makedirs(folder, exist_ok=True)
+
+    three_shot_batch_experiment(train_file, test_file,
+        os.path.join(folder, f"{experiment_type}_{dataset_name}_raw_results.csv"), "raw_data")
+
+    three_shot_batch_experiment(train_file, test_file,
+        os.path.join(folder, f"{experiment_type}_{dataset_name}_decoded_results.csv"), "decoded")
