@@ -24,3 +24,10 @@ outputs/zero_shot/Fuzzy/logs_*.txt
 outputs/one_shot/Fuzzy/logs_*.txt
 outputs/two_shot/Fuzzy/logs_*.txt
 outputs/three_shot/Fuzzy/logs_*.txt
+
+# ignore evaluation files
+evaluation/*.png
+evaluation/*.csv
+
+#ignore data
+data/

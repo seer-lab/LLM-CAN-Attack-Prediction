@@ -10,12 +10,11 @@ key_file = os.path.join(os.path.dirname(__file__), "key.txt")
 with open(key_file, "r") as f:
     api_key = f.read().strip()
 
-
 client = OpenAI(api_key=api_key)
 
 # --- Parameters ---
 BATCH_SIZE = 23
-MAX_ROWS = 300
+MAX_ROWS = 400
 PASS_NUMBER = 5
 
 file_list = [
@@ -24,29 +23,24 @@ file_list = [
 ]
 
 experiment_type = "one_shot"
+NUM_SHOTS = 1
 
 # ------------- SPLIT ----------------
-def split_and_save_dataset(input_file, train_path, test_path, train_ratio=0.8):
+def split_and_save_dataset(input_file, train_path, test_path, train_ratio=0.7):
     with open(input_file, "rb") as f:
         encoding = chardet.detect(f.read())['encoding']
 
     df = pd.read_csv(input_file, encoding=encoding)
-
     df = df.sample(frac=1, random_state=42).reset_index(drop=True)
 
     split_idx = int(len(df) * train_ratio)
-
     train_df = df.iloc[:split_idx]
     test_df = df.iloc[split_idx:]
 
     train_df.to_csv(train_path, index=False)
     test_df.to_csv(test_path, index=False)
 
-    print("\nSplit check:")
-    print(train_df['label'].value_counts())
-    print(test_df['label'].value_counts())
-
-# HELPERS
+# ------------- HELPERS ----------------
 def flatten_decoded(decoded):
     if isinstance(decoded, str):
         try:
@@ -56,46 +50,44 @@ def flatten_decoded(decoded):
             return decoded
     return str(decoded)
 
-def get_data_slice_with_min_T(data, max_rows=100, min_t=5):
+def get_windowed_examples(data, data_column, dataset_name, num_shots=1):
     t_indices = data.index[data['label'] == 'T'].tolist()
+    r_indices = data.index[data['label'] == 'R'].tolist()
 
-    if len(t_indices) < min_t:
-        raise ValueError(f"Not enough T examples! Found {len(t_indices)}")
+    if len(t_indices) < num_shots:
+        raise ValueError(f"Not enough T labels found. Need {num_shots}.")
 
-    for t_idx in t_indices:
-        start_idx = max(0, t_idx - max_rows // 2)
-        end_idx = start_idx + max_rows
-        slice_df = data.iloc[start_idx:end_idx]
+    if "RPM" in dataset_name.upper():
+        attack_desc = "RPM spoofing attack (sudden, physically impossible spikes or drops in values)"
+    else:
+        attack_desc = "Fuzzy attack (random, unrecognized CAN IDs or totally chaotic payloads)"
 
-        if (slice_df['label'] == 'T').sum() >= min_t:
-            return slice_df.reset_index(drop=True)
+    prompt_blocks = []
 
-    raise ValueError("Could not find slice with enough T examples")
+    for i in range(num_shots):
+        t_idx = t_indices[(len(t_indices) // num_shots) * i]
+        t_window = data.iloc[max(0, t_idx - BATCH_SIZE + 1) : t_idx + 1]
+        t_str = "\n".join([f"{row['arbitration_id']},{row[data_column]}" for _, row in t_window.iterrows()])
 
-def get_prompt_example(data, data_column, num_batches=1):
-    total_needed = num_batches * BATCH_SIZE
+        r_idx = r_indices[(len(r_indices) // num_shots) * i + BATCH_SIZE]
+        r_window = data.iloc[max(0, r_idx) : max(0, r_idx) + BATCH_SIZE]
+        r_str = "\n".join([f"{row['arbitration_id']},{row[data_column]}" for _, row in r_window.iterrows()])
 
-    t_data = data[data['label'] == 'T']
-    r_data = data[data['label'] == 'R']
+        block = (
+            f"--- Example {i*2 + 1}: NORMAL SEQUENCE (No Attack) ---\n{r_str}\n"
+            "Result: No, this is normal predictable traffic.\n\n"
+            f"--- Example {i*2 + 2}: {dataset_name.upper()} ATTACK SEQUENCE ---\n{t_str}\n"
+            f"Result: Yes, this contains an anomalous pattern indicating a {attack_desc}.\n"
+        )
+        prompt_blocks.append(block)
 
-    t_sample = t_data.sample(n=1, random_state=42)
-    r_sample = r_data.sample(n=total_needed - 1, random_state=42)
+    return "\n".join(prompt_blocks)
 
-    sample = pd.concat([t_sample, r_sample]).sample(frac=1, random_state=42).reset_index(drop=True)
-
-    prompt = "\n".join([
-        f"{row['arbitration_id']},{row[data_column]} -> {row['label']}"
-        for _, row in sample.iterrows()
-    ])
-
-    return sample, prompt
-
-# ONE-SHOT EXPERIMENT
-def one_shot_batch_experiment(train_file, test_file, output_file, data_column):
+# ------------- EXPERIMENT ----------------
+def one_shot_batch_experiment(train_file, test_file, output_file, data_column, dataset_name):
     try:
         output_dir = os.path.dirname(output_file)
 
-        # --- LOAD TRAIN ---
         with open(train_file, "rb") as f:
             train_encoding = chardet.detect(f.read())['encoding']
         train_data = pd.read_csv(train_file, encoding=train_encoding)
@@ -103,10 +95,8 @@ def one_shot_batch_experiment(train_file, test_file, output_file, data_column):
         if data_column == "decoded":
             train_data['decoded'] = train_data['decoded'].apply(flatten_decoded)
 
-        train_slice = get_data_slice_with_min_T(train_data, MAX_ROWS, 10)
-        _, prompt_example = get_prompt_example(train_slice, data_column)
+        prompt_examples = get_windowed_examples(train_data, data_column, dataset_name, NUM_SHOTS)
 
-        # --- LOAD TEST ---
         with open(test_file, "rb") as f:
             test_encoding = chardet.detect(f.read())['encoding']
         test_data = pd.read_csv(test_file, encoding=test_encoding)
@@ -123,32 +113,31 @@ def one_shot_batch_experiment(train_file, test_file, output_file, data_column):
         for i in range(1, PASS_NUMBER + 1):
             results_df[f"Pass_{i}"] = None
 
+        if "RPM" in dataset_name.upper():
+            attack_definition = "An RPM attack (Spoofing) involves injecting false, sudden, and anomalous RPM values that break the smooth, continuous physical properties of the engine speed."
+        else:
+            attack_definition = "A Fuzzy attack involves flooding the network with random, unrecognized CAN IDs or highly chaotic data payloads."
+
         base_prompt = (
-            "We are trying to identify cybersecurity attacks in CAN messages.\n"
-            "Below are labeled examples (T=attack, R=normal):\n"
-            f"Example:\n{prompt_example}\n"
-            "Now look at the following sequence.\n"
-            "Consider the pattern across all messages.\n\n"
-            "Is the last message part of an attack pattern?\n\n"
+            f"We are analyzing automotive CAN bus traffic for '{dataset_name}' cybersecurity attacks.\n"
+            f"{attack_definition}\n\n"
+            "Below are labeled sequence examples:\n\n"
+            f"{prompt_examples}\n\n"
+            "=== TARGET SEQUENCE ===\n"
+            "Now look at the following sequence of messages.\n"
+            "Consider the pattern across ALL messages in the window.\n\n"
+            f"Does this sequence contain a {dataset_name} attack (is there any injected anomaly anywhere in the sequence)?\n\n"
             "Answer Yes or No, and provide a brief 1-2 sentence reason.\n\n"
         )
 
-        total_rows = len(test_data)
-
         for pass_num in range(1, PASS_NUMBER + 1):
             print(f"\nRunning Pass {pass_num} for {test_file} ({data_column})")
-
             log_file_path = os.path.join(output_dir, f"logs_{data_column}_pass_{pass_num}.txt")
             open(log_file_path, "w").close()
 
-            for i in range(BATCH_SIZE - 1, total_rows):
+            for i in range(BATCH_SIZE - 1, len(test_data)):
                 window_df = test_data.iloc[i - BATCH_SIZE + 1:i + 1]
-
-                batch_messages = "\n".join([
-                    f"{row['arbitration_id']},{row[data_column]}"
-                    for _, row in window_df.iterrows()
-                ])
-
+                batch_messages = "\n".join([f"{row['arbitration_id']},{row[data_column]}" for _, row in window_df.iterrows()])
                 test_case = base_prompt + batch_messages
 
                 try:
@@ -156,7 +145,7 @@ def one_shot_batch_experiment(train_file, test_file, output_file, data_column):
                         model="gpt-4o-mini",
                         temperature=0,
                         messages=[
-                            {"role": "system", "content": "You are a cybersecurity analyst specializing in automotive CAN traffic."},
+                            {"role": "system", "content": "You are a cybersecurity analyst. Your primary goal is to detect anomalous injected patterns in CAN traffic windows."},
                             {"role": "user", "content": test_case}
                         ]
                     )
@@ -169,52 +158,36 @@ def one_shot_batch_experiment(train_file, test_file, output_file, data_column):
                 results_df.at[last_idx, "Batch_ID"] = i
 
                 with open(log_file_path, "a", encoding="utf-8") as log_file:
-                    log_file.write(f"\n--- Window ending at index {i} ---\n")
-                    log_file.write("PROMPT:\n" + test_case + "\n")
-                    log_file.write("RESPONSE:\n" + prediction + "\n")
+                    log_file.write(f"\n--- Window ending at index {i} ---\nPROMPT:\n{test_case}\nRESPONSE:\n{prediction}\n")
 
-        columns_to_keep = ['arbitration_id', data_column, 'Batch_ID'] + [
-            f'Pass_{i}' for i in range(1, PASS_NUMBER + 1)
-        ]
-        results_df = results_df[columns_to_keep]
-
+        cols = ['arbitration_id', data_column, 'Batch_ID'] + [f'Pass_{i}' for i in range(1, PASS_NUMBER + 1)]
+        results_df = results_df[cols]
         results_df.to_csv(output_file, index=False, encoding="utf-8")
 
     except Exception as e:
         print(f"Error: {e}")
 
-# MAIN PIPELINE
+# ------------- MAIN ----------------
 base_data_folder = "data"
 train_folder = os.path.join(base_data_folder, "train")
 test_folder = os.path.join(base_data_folder, "test")
-
 os.makedirs(train_folder, exist_ok=True)
 os.makedirs(test_folder, exist_ok=True)
 
-# --- SPLIT DATA FIRST ---
 for input_file in file_list:
-    file_name = os.path.basename(input_file)
+    name = os.path.basename(input_file)
+    split_and_save_dataset(input_file, os.path.join(train_folder, name), os.path.join(test_folder, name))
 
-    train_file = os.path.join(train_folder, file_name)
-    test_file = os.path.join(test_folder, file_name)
-
-    split_and_save_dataset(input_file, train_file, test_file)
-
-
-# --- RUN EXPERIMENT ---
 base_output_folder = "outputs"
 
-for file_name in ["RPM_dataset_decoded.csv", "Fuzzy_dataset_decoded.csv"]:
+for input_file in file_list:
+    file_name = os.path.basename(input_file)
     train_file = os.path.join(train_folder, file_name)
     test_file = os.path.join(test_folder, file_name)
-
     dataset_name = file_name.replace("_dataset_decoded.csv", "")
 
-    folder_path = os.path.join(base_output_folder, experiment_type, dataset_name)
-    os.makedirs(folder_path, exist_ok=True)
+    folder = os.path.join(base_output_folder, experiment_type, dataset_name)
+    os.makedirs(folder, exist_ok=True)
 
-    raw_output_file = os.path.join(folder_path, f"{experiment_type}_{dataset_name}_raw_results.csv")
-    decoded_output_file = os.path.join(folder_path, f"{experiment_type}_{dataset_name}_decoded_results.csv")
-
-    one_shot_batch_experiment(train_file, test_file, raw_output_file, "raw_data")
-    one_shot_batch_experiment(train_file, test_file, decoded_output_file, "decoded")
+    one_shot_batch_experiment(train_file, test_file, os.path.join(folder, f"{experiment_type}_{dataset_name}_raw_results.csv"), "raw_data", dataset_name)
+    one_shot_batch_experiment(train_file, test_file, os.path.join(folder, f"{experiment_type}_{dataset_name}_decoded_results.csv"), "decoded", dataset_name)
