@@ -70,20 +70,28 @@ def zero_shot_batch_experiment(test_file, output_file, data_column, dataset_name
         for i in range(1, PASS_NUMBER + 1):
             results_df[f"Pass_{i}"] = None
 
-        # --- DYNAMIC PROMPT ---
         if "RPM" in dataset_name.upper():
-            attack_definition = "An RPM attack (Spoofing) involves injecting false, sudden, and anomalous RPM values that break the smooth, continuous physical properties of the engine speed."
+            attack_definition = (
+                "An RPM attack (Spoofing) involves sudden, unrealistic changes in RPM values "
+                "that break the smooth and continuous physical behavior of engine speed.\n"
+                "Even a single message can indicate an attack if it deviates sharply from prior values.\n"
+            )
         else:
-            attack_definition = "A Fuzzy attack involves flooding the network with random, unrecognized CAN IDs or highly chaotic data payloads."
+            attack_definition = (
+                "A Fuzzy attack is characterized by a sustained pattern of many different arbitration IDs "
+                "appearing across the window, with little repetition.\n"
+                "Normal traffic shows repeated arbitration IDs over time.\n"
+                "A single message alone is NOT enough to determine an attack; the decision depends on the overall pattern in the window.\n"
+            )
 
         base_prompt = (
             f"We are analyzing automotive CAN bus traffic for '{dataset_name}' cybersecurity attacks.\n"
             f"{attack_definition}\n\n"
             "=== TARGET SEQUENCE ===\n"
             "Look at the following sequence of messages.\n"
-            "Consider the pattern across ALL messages in the window.\n\n"
-            f"Does this sequence contain a {dataset_name} attack (is there any injected anomaly anywhere in the sequence)?\n\n"
-            "Answer Yes or No, and provide a brief 1-2 sentence reason.\n\n"
+            "Use the sequence as context to understand normal behavior.\n\n"
+            "Does the FINAL message indicate an attack?\n"
+            "Answer Yes or No and provide a brief 1–2 sentence reason.\n\n"
         )
 
         for pass_num in range(1, PASS_NUMBER + 1):

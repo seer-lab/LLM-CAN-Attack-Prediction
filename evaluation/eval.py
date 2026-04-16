@@ -5,6 +5,8 @@ from collections import Counter
 
 # ---------------- CONFIG ----------------
 PASS_NUMBER = 5
+BATCH_SIZE = 23
+MAX_ROWS = 400
 
 base_output_folder = "./outputs"
 base_test_folder = "./data/test"
@@ -29,12 +31,13 @@ def extract_prediction(text):
 
     return None
 
-def adaptive_majority_vote(row, dataset):
-    """
-    Returns 'T' or 'R' using dataset-specific threshold.
-    - RPM: majority vote (more than half)
-    - Fuzzy: if any T, return T; else R -- only because Fuzzy is very imbalanced (~2% T's)
-    """
+def has_none(row):
+    for i in range(1, PASS_NUMBER + 1):
+        if extract_prediction(row.get(f"Pass_{i}", None)) is None:
+            return True
+    return False
+
+def majority_vote(row, dataset):
     votes = []
     for i in range(1, PASS_NUMBER + 1):
         pred = extract_prediction(row.get(f"Pass_{i}", None))
@@ -44,19 +47,10 @@ def adaptive_majority_vote(row, dataset):
     t_count = votes.count("T")
     r_count = votes.count("R")
 
-    if dataset == "RPM":
-        threshold = (PASS_NUMBER // 2) + 1  # majority
-        if t_count >= threshold:
-            return "T"
-        elif r_count >= threshold:
-            return "R"
-        else:
-            return "R"  # fallback to R if no majority
-    else:  # Fuzzy
-        if t_count >= 1:
-            return "T"
-        else:
-            return "R"  # fallback to R if no T
+    if t_count >= 1:
+        return "T"
+    else:
+        return "R"
 
 def compute_metrics(y_true, y_pred):
     TP = FP = TN = FN = 0
@@ -109,15 +103,21 @@ for dataset in datasets:
         dec_df = pd.read_csv(dec_file).copy()
 
         # ---------------- APPLY ADAPTIVE VOTE ----------------
-        raw_df["Final"] = raw_df.apply(lambda row: adaptive_majority_vote(row, dataset), axis=1)
-        dec_df["Final"] = dec_df.apply(lambda row: adaptive_majority_vote(row, dataset), axis=1)
+        raw_df["Final"] = raw_df.apply(lambda row: majority_vote(row, dataset), axis=1)
+        dec_df["Final"] = dec_df.apply(lambda row: majority_vote(row, dataset), axis=1)
 
         # Align lengths
-        min_len = min(len(test_df), len(raw_df), len(dec_df))
-        y_true = test_df["label"].iloc[:min_len]
+        min_len = min(len(test_df) - (BATCH_SIZE - 1), len(raw_df), len(dec_df))
 
-        y_raw = raw_df["Final"].iloc[:min_len]
-        y_dec = dec_df["Final"].iloc[:min_len]
+        start = BATCH_SIZE - 1
+
+        y_true = test_df["label"].iloc[start:start + min_len].values
+        y_raw = raw_df["Final"].iloc[:min_len].values
+        y_dec = dec_df["Final"].iloc[:min_len].values
+
+        raw_df = raw_df[~raw_df.apply(has_none, axis=1)].copy()
+        dec_df = dec_df[~dec_df.apply(has_none, axis=1)].copy()
+        test_df = test_df.iloc[:len(raw_df)]  # realign if needed
 
         # ---------------- METRICS ----------------
         raw_metrics = compute_metrics(y_true, y_raw)
@@ -189,6 +189,9 @@ for dataset in datasets:
 
         # ---------------- PER-PASS METRICS ----------------
         for i in range(1, PASS_NUMBER + 1):
+
+            print(f"Pass_{i} unique:", raw_df[f"Pass_{i}"].apply(extract_prediction).value_counts(dropna=False))
+
             raw_preds = raw_df[f"Pass_{i}"].apply(extract_prediction).iloc[:min_len]
             dec_preds = dec_df[f"Pass_{i}"].apply(extract_prediction).iloc[:min_len]
 
@@ -222,26 +225,25 @@ per_pass_df = pd.DataFrame(per_pass_rows)
 per_pass_df.to_csv("evaluation/per_pass_summary.csv", index=False)
 print("Saved: evaluation/per_pass_summary.csv")
 # ---------------- PLOTTING (SEPARATED BY DATASET) ----------------
+import numpy as np
 
 def plot_metric(raw_col, dec_col, title, ylabel, filename_prefix):
-    """
-    Creates one plot per dataset (RPM, Fuzzy) instead of mixing them.
-    """
     for dataset in datasets:
-        plt.figure(figsize=(8, 5))
-
         sub = summary_df[summary_df["Dataset"] == dataset]
 
-        plt.plot(sub["Shot"], sub[raw_col],
-                 marker='o', linestyle='--', label="Raw")
-        plt.plot(sub["Shot"], sub[dec_col],
-                 marker='o', linestyle='-', label="Decoded")
+        x = np.arange(len(sub["Shot"]))
+        width = 0.35
 
+        plt.figure(figsize=(8, 5))
+        plt.bar(x - width/2, sub[raw_col], width, label="Raw")
+        plt.bar(x + width/2, sub[dec_col], width, label="Decoded")
+
+        plt.xticks(x, sub["Shot"])
         plt.title(f"{dataset} - {title}")
         plt.xlabel("Shot Type")
         plt.ylabel(ylabel)
         plt.legend()
-        plt.grid(True)
+        plt.grid(axis='y')
 
         filename = f"{filename_prefix}_{dataset}.png"
         plt.savefig(filename)
@@ -249,15 +251,18 @@ def plot_metric(raw_col, dec_col, title, ylabel, filename_prefix):
 
         print(f"Saved plot: {filename}")
 
+def plot_per_pass(metric_col, label_type, title, ylabel, filename_prefix):
+    """
+    metric_col: column name (e.g., 'Raw_AttackRecall' or 'Decoded_AttackRecall')
+    label_type: 'Raw' or 'Decoded'
+    """
 
-def plot_per_pass(metric_raw, metric_dec, title, ylabel, filename_prefix):
-    """
-    Creates one per-pass plot per dataset.
-    """
     for dataset in datasets:
+
         plt.figure(figsize=(10, 6))
 
         for shot in experiments:
+
             sub = per_pass_df[
                 (per_pass_df["Dataset"] == dataset) &
                 (per_pass_df["Shot"] == shot)
@@ -266,23 +271,26 @@ def plot_per_pass(metric_raw, metric_dec, title, ylabel, filename_prefix):
             if sub.empty:
                 continue
 
-            x = [int(p.split("_")[1]) for p in sub["Pass"]]
+            sub = sub.sort_values(by="Pass")
 
-            plt.plot(x, sub[metric_raw],
-                     linestyle='--', marker='o',
-                     label=f"{shot}-Raw")
+            x = np.arange(len(sub))
 
-            plt.plot(x, sub[metric_dec],
-                     linestyle='-', marker='o',
-                     label=f"{shot}-Decoded")
+            plt.plot(
+                x,
+                sub[metric_col],
+                marker='o',
+                linewidth=2,
+                label=shot
+            )
 
-        plt.title(f"{dataset} - {title}")
+        plt.xticks(x, sub["Pass"])
+        plt.title(f"{dataset} - {title} ({label_type})")
         plt.xlabel("Pass Number")
         plt.ylabel(ylabel)
-        plt.legend()
+        plt.legend(title="Shot Type")
         plt.grid(True)
 
-        filename = f"{filename_prefix}_{dataset}.png"
+        filename = f"{filename_prefix}_{dataset}_{label_type}.png"
         plt.savefig(filename)
         plt.show()
 
