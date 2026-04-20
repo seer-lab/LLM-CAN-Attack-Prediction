@@ -14,7 +14,7 @@ client = OpenAI(api_key=api_key)
 
 # --- Parameters ---
 BATCH_SIZE = 23
-MAX_ROWS = 400
+MAX_ROWS = 500
 PASS_NUMBER = 5
 
 file_list = [
@@ -115,18 +115,20 @@ def two_shot_batch_experiment(train_file, test_file, output_file, data_column, d
 
         if "RPM" in dataset_name.upper():
             attack_definition = (
-                "An RPM attack (Spoofing) involves sudden, unrealistic changes in RPM values "
-                "that break the smooth and continuous physical behavior of engine speed.\n"
-                "Even a single message can indicate an attack if it deviates sharply from prior values.\n"
+                "An RPM attack is a point-level anomaly in automotive CAN traffic where a message contains physically implausible or abrupt changes in RPM-related values that break normal smooth engine behavior.\n"
+                "Normal traffic shows gradual, physically consistent changes in RPM and related engine signals.\n"
+                "The label is assigned to the FINAL message, and the decision is based primarily on the values in that message compared to normal physical constraints and recent behavior.\n"
+                "Decision rule: classify as RPM attack if the final message shows a sudden or physically impossible deviation in RPM-related signals; otherwise classify as normal.\n"
+                "A single message can be sufficient to detect an RPM attack.\n"
             )
         else:
             attack_definition = (
-                "A Fuzzy attack is characterized by a sustained pattern of many different arbitration IDs "
-                "appearing across the window, with little repetition.\n"
-                "Normal traffic shows repeated arbitration IDs over time.\n"
-                "A single message alone is NOT enough to determine an attack; the decision depends on the overall pattern in the window.\n"
+                "A Fuzzy attack is a window-level pattern in automotive CAN traffic where the sequence ending at the FINAL message shows frequent changes in arbitration IDs instead of stable repetition."
+                "Normal traffic shows the same arbitration IDs repeating regularly across nearby messages, forming a consistent pattern."
+                "The label is assigned to the FINAL message, but the decision must be based on the sequence leading up to it, not the final message alone."
+                "Decision rule: focus on the most recent messages in the window and check whether arbitration IDs keep changing from one message to the next instead of repeating. If IDs are frequently different and do not form a stable repeating pattern, classify as Fuzzy attack; otherwise classify as normal."
+                "Do not rely on a single message; use the recent sequence pattern."
             )
-
         base_prompt = (
             f"We are analyzing automotive CAN bus traffic for '{dataset_name}' cybersecurity attacks.\n"
             f"{attack_definition}\n\n"

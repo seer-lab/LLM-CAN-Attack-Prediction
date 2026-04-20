@@ -2,11 +2,15 @@ import os
 import pandas as pd
 import matplotlib.pyplot as plt
 from collections import Counter
+import numpy as np
+import re
+
+from sklearn.metrics import precision_recall_curve,roc_curve, average_precision_score, roc_auc_score
+
+import seaborn as sns
 
 # ---------------- CONFIG ----------------
 PASS_NUMBER = 5
-BATCH_SIZE = 23
-MAX_ROWS = 400
 
 base_output_folder = "./outputs"
 base_test_folder = "./data/test"
@@ -22,35 +26,44 @@ def extract_prediction(text):
     if not isinstance(text, str):
         return None
 
-    text = text.strip().lower()
+    t = text.lower()
 
-    if text.startswith("yes"):
+    if re.search(r"\byes\b", t):
         return "T"
-    elif text.startswith("no"):
+    if re.search(r"\bno\b", t):
         return "R"
 
     return None
 
-def has_none(row):
-    for i in range(1, PASS_NUMBER + 1):
-        if extract_prediction(row.get(f"Pass_{i}", None)) is None:
-            return True
-    return False
 
-def majority_vote(row, dataset):
+
+def majority_vote(row):
     votes = []
     for i in range(1, PASS_NUMBER + 1):
-        pred = extract_prediction(row.get(f"Pass_{i}", None))
-        if pred:
-            votes.append(pred)
+        p = extract_prediction(row.get(f"Pass_{i}", None))
+        if p:
+            votes.append(p)
 
-    t_count = votes.count("T")
-    r_count = votes.count("R")
-
-    if t_count >= 1:
-        return "T"
-    else:
+    if len(votes) == 0:
         return "R"
+
+    return Counter(votes).most_common(1)[0][0]
+
+
+def get_score(row):
+    votes = []
+    for i in range(1, PASS_NUMBER + 1):
+        p = extract_prediction(row.get(f"Pass_{i}", None))
+        if p == "T":
+            votes.append(1)
+        elif p == "R":
+            votes.append(0)
+
+    if len(votes) == 0:
+        return 0.5
+
+    return np.mean(votes)
+
 
 def compute_metrics(y_true, y_pred):
     TP = FP = TN = FN = 0
@@ -76,16 +89,19 @@ def compute_metrics(y_true, y_pred):
         "Accuracy": accuracy,
         "Attack_Precision": precision,
         "Attack_Recall": recall,
-        "Attack_F1": f1,
-        "TP": TP, "TN": TN, "FP": FP, "FN": FN
+        "Attack_F1": f1
     }
+
+
+# ---------------- STORAGE ----------------
+summary_rows = []
+per_pass_rows = []
+curve_data = []
 
 # ---------------- MAIN ----------------
 
-summary_rows = []
-per_pass_rows = []
-
 for dataset in datasets:
+
     test_file = os.path.join(base_test_folder, f"{dataset}_dataset_decoded.csv")
     test_df = pd.read_csv(test_file)
 
@@ -95,67 +111,46 @@ for dataset in datasets:
         dec_file = os.path.join(base_output_folder, exp, dataset, f"{exp}_{dataset}_decoded_results.csv")
 
         if not os.path.exists(raw_file) or not os.path.exists(dec_file):
-            print(f"Missing files: {exp} | {dataset}")
+            print(f"Missing: {exp} | {dataset}")
             continue
 
-        # Load predictions
         raw_df = pd.read_csv(raw_file).copy()
         dec_df = pd.read_csv(dec_file).copy()
 
-        # ---------------- APPLY ADAPTIVE VOTE ----------------
-        raw_df["Final"] = raw_df.apply(lambda row: majority_vote(row, dataset), axis=1)
-        dec_df["Final"] = dec_df.apply(lambda row: majority_vote(row, dataset), axis=1)
+        # ---------------- ALIGNMENT FIX ----------------
+        min_len = min(len(test_df), len(raw_df), len(dec_df))
 
-        # Align lengths
-        min_len = min(len(test_df) - (BATCH_SIZE - 1), len(raw_df), len(dec_df))
+        test_df = test_df.iloc[:min_len].reset_index(drop=True)
+        raw_df = raw_df.iloc[:min_len].reset_index(drop=True)
+        dec_df = dec_df.iloc[:min_len].reset_index(drop=True)
 
-        start = BATCH_SIZE - 1
+        y_true = test_df["label"].values
+        y_true_bin = [1 if y == "T" else 0 for y in y_true]
 
-        y_true = test_df["label"].iloc[start:start + min_len].values
-        y_raw = raw_df["Final"].iloc[:min_len].values
-        y_dec = dec_df["Final"].iloc[:min_len].values
+        # ---------------- FINAL PREDICTIONS ----------------
+        raw_df["Final"] = raw_df.apply(majority_vote, axis=1)
+        dec_df["Final"] = dec_df.apply(majority_vote, axis=1)
 
-        raw_df = raw_df[~raw_df.apply(has_none, axis=1)].copy()
-        dec_df = dec_df[~dec_df.apply(has_none, axis=1)].copy()
-        test_df = test_df.iloc[:len(raw_df)]  # realign if needed
+        y_raw = raw_df["Final"].values
+        y_dec = dec_df["Final"].values
+
+        # ---------------- SCORES ----------------
+        raw_scores = raw_df.apply(get_score, axis=1).values
+        dec_scores = dec_df.apply(get_score, axis=1).values
+
+        curve_data.append({
+            "Dataset": dataset,
+            "Shot": exp,
+            "y_true": y_true_bin,
+            "raw_scores": list(raw_scores),
+            "dec_scores": list(dec_scores)
+        })
 
         # ---------------- METRICS ----------------
         raw_metrics = compute_metrics(y_true, y_raw)
         dec_metrics = compute_metrics(y_true, y_dec)
 
-        # ---------------- DISAGREEMENT ANALYSIS ----------------
-        comp = pd.DataFrame({
-            "true": y_true,
-            "raw": y_raw,
-            "decoded": y_dec
-        })
-
-        diff = comp[comp["raw"] != comp["decoded"]]
-        decoded_better = diff[(diff["decoded"] == diff["true"]) & (diff["raw"] != diff["true"])]
-        decoded_worse = diff[(diff["raw"] == diff["true"]) & (diff["decoded"] != diff["true"])]
-
-        if len(decoded_better) > len(decoded_worse):
-            insight = "Decoded helps"
-        elif len(decoded_better) < len(decoded_worse):
-            insight = "Decoded hurts"
-        else:
-            insight = "No significant difference"
-
-        # ---------------- PRINT TABLE ----------------
-        print(f"\n=== {dataset} | {exp} ===")
-        print(pd.DataFrame([{
-            "Raw Recall": raw_metrics["Attack_Recall"],
-            "Decoded Recall": dec_metrics["Attack_Recall"],
-            "Raw F1": raw_metrics["Attack_F1"],
-            "Decoded F1": dec_metrics["Attack_F1"]
-        }]).to_string(index=False))
-
-        # Optional: count T occurrences per pass for inspection
-        print("Raw T counts:", Counter(raw_df["Final"].iloc[:min_len]))
-        print("Decoded T counts:", Counter(dec_df["Final"].iloc[:min_len]))
-
-        # ---------------- STORE SUMMARY ----------------
-        row = {
+        summary_rows.append({
             "Dataset": dataset,
             "Shot": exp,
 
@@ -170,30 +165,16 @@ for dataset in datasets:
 
             "Raw_AttackF1": raw_metrics["Attack_F1"],
             "Decoded_AttackF1": dec_metrics["Attack_F1"],
+        })
 
-            "Decoded_Better": len(decoded_better),
-            "Decoded_Worse": len(decoded_worse),
-            "Total_Disagreements": len(diff),
-            "Insight": insight
-        }
-
-        if raw_metrics["Attack_Recall"] != 0:
-            row["Recall_Improvement_%"] = (
-                (dec_metrics["Attack_Recall"] - raw_metrics["Attack_Recall"])
-                / raw_metrics["Attack_Recall"] * 100
-            )
-        else:
-            row["Recall_Improvement_%"] = 0
-
-        summary_rows.append(row)
-
-        # ---------------- PER-PASS METRICS ----------------
+        # ---------------- PER PASS ----------------
         for i in range(1, PASS_NUMBER + 1):
 
-            print(f"Pass_{i} unique:", raw_df[f"Pass_{i}"].apply(extract_prediction).value_counts(dropna=False))
+            raw_preds = raw_df[f"Pass_{i}"].apply(extract_prediction)
+            dec_preds = dec_df[f"Pass_{i}"].apply(extract_prediction)
 
-            raw_preds = raw_df[f"Pass_{i}"].apply(extract_prediction).iloc[:min_len]
-            dec_preds = dec_df[f"Pass_{i}"].apply(extract_prediction).iloc[:min_len]
+            raw_preds = raw_preds.fillna("R")
+            dec_preds = dec_preds.fillna("R")
 
             raw_m = compute_metrics(y_true, raw_preds)
             dec_m = compute_metrics(y_true, dec_preds)
@@ -202,9 +183,6 @@ for dataset in datasets:
                 "Dataset": dataset,
                 "Shot": exp,
                 "Pass": f"Pass_{i}",
-
-                "Raw_Accuracy": raw_m["Accuracy"],
-                "Decoded_Accuracy": dec_m["Accuracy"],
 
                 "Raw_AttackPrecision": raw_m["Attack_Precision"],
                 "Decoded_AttackPrecision": dec_m["Attack_Precision"],
@@ -216,110 +194,141 @@ for dataset in datasets:
                 "Decoded_AttackF1": dec_m["Attack_F1"],
             })
 
-# ---------------- SAVE CSV ----------------
+# ---------------- SAVE ----------------
+
 summary_df = pd.DataFrame(summary_rows)
-summary_df.to_csv("evaluation/final_summary.csv", index=False)
-print("\nSaved: evaluation/final_summary.csv")
-
 per_pass_df = pd.DataFrame(per_pass_rows)
-per_pass_df.to_csv("evaluation/per_pass_summary.csv", index=False)
-print("Saved: evaluation/per_pass_summary.csv")
-# ---------------- PLOTTING (SEPARATED BY DATASET) ----------------
-import numpy as np
 
-def plot_metric(raw_col, dec_col, title, ylabel, filename_prefix):
+summary_df.to_csv("evaluation/final_summary.csv", index=False)
+per_pass_df.to_csv("evaluation/per_pass_summary.csv", index=False)
+
+# ---------------- AUC (FIXED) ----------------
+
+auc_rows = []
+
+for item in curve_data:
+
+    y_true = item["y_true"]
+    raw_scores = item["raw_scores"]
+    dec_scores = item["dec_scores"]
+
+    pr_raw = average_precision_score(y_true, raw_scores)
+    pr_dec = average_precision_score(y_true, dec_scores)
+
+    roc_raw = roc_auc_score(y_true, raw_scores)
+    roc_dec = roc_auc_score(y_true, dec_scores)
+
+    auc_rows.append({
+        "Dataset": item["Dataset"],
+        "Shot": item["Shot"],
+        "PR_AUC_Raw": pr_raw,
+        "PR_AUC_Decoded": pr_dec,
+        "ROC_AUC_Raw": roc_raw,
+        "ROC_AUC_Decoded": roc_dec,
+    })
+
+auc_df = pd.DataFrame(auc_rows)
+auc_df.to_csv("evaluation/auc_summary.csv", index=False)
+
+# ---------------- PLOTS ----------------
+
+def plot_metric(raw_col, dec_col, title):
     for dataset in datasets:
         sub = summary_df[summary_df["Dataset"] == dataset]
+        x = np.arange(len(sub))
+        w = 0.35
 
-        x = np.arange(len(sub["Shot"]))
-        width = 0.35
-
-        plt.figure(figsize=(8, 5))
-        plt.bar(x - width/2, sub[raw_col], width, label="Raw")
-        plt.bar(x + width/2, sub[dec_col], width, label="Decoded")
-
+        plt.figure()
+        plt.bar(x - w/2, sub[raw_col], width=w, label="Raw")
+        plt.bar(x + w/2, sub[dec_col], width=w, label="Decoded")
         plt.xticks(x, sub["Shot"])
         plt.title(f"{dataset} - {title}")
-        plt.xlabel("Shot Type")
-        plt.ylabel(ylabel)
         plt.legend()
-        plt.grid(axis='y')
-
-        filename = f"{filename_prefix}_{dataset}.png"
-        plt.savefig(filename)
+        plt.grid()
+        plt.savefig(f"evaluation/{title}_{dataset}.png")
         plt.show()
 
-        print(f"Saved plot: {filename}")
 
-def plot_per_pass(metric_col, label_type, title, ylabel, filename_prefix):
-    """
-    metric_col: column name (e.g., 'Raw_AttackRecall' or 'Decoded_AttackRecall')
-    label_type: 'Raw' or 'Decoded'
-    """
-
+def plot_per_pass(metric):
     for dataset in datasets:
-
-        plt.figure(figsize=(10, 6))
+        plt.figure()
 
         for shot in experiments:
-
             sub = per_pass_df[
                 (per_pass_df["Dataset"] == dataset) &
                 (per_pass_df["Shot"] == shot)
-            ]
-
-            if sub.empty:
-                continue
-
-            sub = sub.sort_values(by="Pass")
+            ].sort_values("Pass")
 
             x = np.arange(len(sub))
+            plt.plot(x, sub[metric], marker='o', label=shot)
 
-            plt.plot(
-                x,
-                sub[metric_col],
-                marker='o',
-                linewidth=2,
-                label=shot
-            )
-
-        plt.xticks(x, sub["Pass"])
-        plt.title(f"{dataset} - {title} ({label_type})")
-        plt.xlabel("Pass Number")
-        plt.ylabel(ylabel)
-        plt.legend(title="Shot Type")
-        plt.grid(True)
-
-        filename = f"{filename_prefix}_{dataset}_{label_type}.png"
-        plt.savefig(filename)
+        plt.title(f"{dataset} - {metric}")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"evaluation/{metric}_{dataset}.png")
         plt.show()
 
-        print(f"Saved plot: {filename}")
 
+def plot_pr_roc():
+    for dataset in datasets:
 
-# ---------------- RUN PLOTS ----------------
+        plt.figure()
+        for item in curve_data:
+            if item["Dataset"] != dataset:
+                continue
 
-plot_metric("Raw_AttackRecall", "Decoded_AttackRecall",
-            "Attack Recall", "Recall",
-            "evaluation/attack_recall")
+            p1, r1, _ = precision_recall_curve(item["y_true"], item["raw_scores"])
+            p2, r2, _ = precision_recall_curve(item["y_true"], item["dec_scores"])
 
-plot_metric("Raw_AttackPrecision", "Decoded_AttackPrecision",
-            "Attack Precision", "Precision",
-            "evaluation/attack_precision")
+            plt.plot(r1, p1, "--", label=f"{item['Shot']} Raw")
+            plt.plot(r2, p2, label=f"{item['Shot']} Decoded")
 
-plot_metric("Raw_AttackF1", "Decoded_AttackF1",
-            "Attack F1", "F1 Score",
-            "evaluation/attack_f1")
+        plt.title(f"{dataset} PR Curve")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"evaluation/pr_{dataset}.png")
+        plt.show()
 
+        plt.figure()
+        for item in curve_data:
+            if item["Dataset"] != dataset:
+                continue
 
-plot_per_pass("Raw_AttackRecall", "Decoded_AttackRecall",
-            "Per-Pass Attack Recall", "Recall",
-            "evaluation/per_pass_recall")
+            f1, t1, _ = roc_curve(item["y_true"], item["raw_scores"])
+            f2, t2, _ = roc_curve(item["y_true"], item["dec_scores"])
 
-plot_per_pass("Raw_AttackPrecision", "Decoded_AttackPrecision",
-            "Per-Pass Attack Precision", "Precision",
-            "evaluation/per_pass_precision")
+            plt.plot(f1, t1, "--", label=f"{item['Shot']} Raw")
+            plt.plot(f2, t2, label=f"{item['Shot']} Decoded")
 
-plot_per_pass("Raw_AttackF1", "Decoded_AttackF1",
-            "Per-Pass Attack F1", "F1 Score",
-            "evaluation/per_pass_f1")
+        plt.title(f"{dataset} ROC Curve")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"evaluation/roc_{dataset}.png")
+        plt.show()
+
+def plot_delta():
+    for dataset in datasets:
+        sub = summary_df[summary_df["Dataset"] == dataset]
+
+        for metric in ["AttackRecall", "AttackPrecision", "AttackF1"]:
+            delta = sub[f"Decoded_{metric}"] - sub[f"Raw_{metric}"]
+
+            plt.figure()
+            plt.bar(sub["Shot"], delta)
+            plt.axhline(0)
+            plt.title(f"{dataset} Δ {metric}")
+            plt.grid()
+            plt.savefig(f"evaluation/delta_{dataset}_{metric}.png")
+            plt.show()
+
+# ---------------- RUN ----------------
+
+plot_metric("Raw_AttackRecall", "Decoded_AttackRecall", "Recall")
+plot_metric("Raw_AttackPrecision", "Decoded_AttackPrecision", "Precision")
+plot_metric("Raw_AttackF1", "Decoded_AttackF1", "F1")
+
+plot_per_pass("Raw_AttackRecall")
+plot_per_pass("Decoded_AttackRecall")
+
+plot_pr_roc()
+plot_delta()
